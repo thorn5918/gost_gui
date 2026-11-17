@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
@@ -247,9 +249,10 @@ type win struct {
 	tv       *walk.TableView
 	logBox   *walk.TextEdit
 
-	provFilter  string
-	includeFail bool
-	provsKey    string
+	provFilter     string
+	includeFail    bool
+	provsKey       string
+	refreshPending atomic.Bool
 }
 
 // Run 启动 GUI 主循环（阻塞）。
@@ -366,8 +369,16 @@ func Run(version string) {
 		return
 	}
 
-	// 池变化 → UI 刷新
-	app.Pool.Notify = func() { w.mw.Synchronize(w.refresh) }
+	// 池变化 → UI 刷新（150ms 节流合并：批量检测高频回调时不刷爆 UI）
+	app.Pool.Notify = func() {
+		if w.refreshPending.Swap(true) {
+			return
+		}
+		time.AfterFunc(150*time.Millisecond, func() {
+			w.refreshPending.Store(false)
+			w.mw.Synchronize(w.refresh)
+		})
+	}
 
 	// 关闭时记录日志
 	w.mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
@@ -437,6 +448,9 @@ func (w *win) refresh() {
 	}
 	w.model.applySort()
 	w.model.PublishRowsReset()
+	// walk TableView 为自绘控件，重置行数据后必须强制重绘，
+	// 否则单元格文本要等鼠标事件才刷新
+	_ = w.tv.Invalidate()
 
 	// 主卡片
 	active := w.app.Pool.Active()
