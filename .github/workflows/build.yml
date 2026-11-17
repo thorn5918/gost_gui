@@ -1,0 +1,57 @@
+name: build
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Download gost kernel
+        shell: pwsh
+        run: |
+          $ver = "3.3.3"
+          $url = "https://github.com/go-gost/gost/releases/download/v$ver/gost_${ver}_windows_amd64.zip"
+          Invoke-WebRequest -Uri $url -OutFile gost.zip -MaximumRetryCount 3
+          Expand-Archive -Path gost.zip -DestinationPath gosttmp -Force
+          New-Item -ItemType Directory -Force -Path internal/gostbin | Out-Null
+          # gzip 压缩以便内嵌
+          $src = [System.IO.File]::OpenRead("gosttmp/gost.exe")
+          $dst = [System.IO.File]::Create("internal/gostbin/gost.exe.gz")
+          $gz = New-Object System.IO.Compression.GZipStream($dst, [System.IO.Compression.CompressionLevel]::SmallestSize)
+          $src.CopyTo($gz); $gz.Close(); $src.Close()
+
+      - name: Build
+        run: |
+          go install github.com/akavel/rsrc@v0.10.2
+          rsrc -arch amd64 -manifest assets/s5picker.manifest -ico assets/app.ico -o rsrc_windows_amd64.syso
+          go build -trimpath -ldflags "-s -w -H windowsgui" -o build/s5picker.exe .
+          dir build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: s5picker-windows
+          path: build/s5picker.exe
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/s5picker.exe

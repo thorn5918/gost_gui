@@ -1,0 +1,16 @@
+# 构建产物
+build/
+s5picker.exe
+s5picker
+
+# 内嵌 gost 内核（构建脚本/CI 下载生成）
+internal/gostbin/gost
+internal/gostbin/gost.exe
+internal/gostbin/*.gz
+internal/gostbin/*.bak
+
+# 运行时文件
+proxies.txt
+proxies_ok.txt
+config.json
+s5picker.log
