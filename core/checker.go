@@ -1,7 +1,6 @@
 package core
 
 import (
-	"fmt"
 	"sync"
 	"time"
 
@@ -35,13 +34,12 @@ func (c *Checker) CheckAll() {
 	if conc <= 0 {
 		conc = 32
 	}
-	done := make(chan struct{}, conc)
 	go func() {
 		sem := make(chan struct{}, conc)
 		for _, t := range targets {
 			sem <- struct{}{}
 			go func(p *Proxy) {
-				defer func() { <-sem; done <- struct{}{} }()
+				defer func() { <-sem }()
 				c.CheckOne(p)
 			}(t)
 		}
@@ -81,10 +79,9 @@ func (c *Checker) CheckAllSync() {
 }
 
 // CheckOne 检测单个代理并更新池。同步阻塞。
+// 调用方（CheckAll/CheckAllSync）负责事先 SetChecking；
+// 本函数结束时无条件解除标记，保证状态不会卡在"检测中"。
 func (c *Checker) CheckOne(p *Proxy) util.GeoResult {
-	if !c.Pool.SetChecking(p.Raw) {
-		return util.GeoResult{Err: fmt.Errorf("正在检测中")}
-	}
 	defer c.Pool.UnsetChecking(p.Raw)
 
 	r := util.QueryViaProxy(p.Raw, c.timeout())
