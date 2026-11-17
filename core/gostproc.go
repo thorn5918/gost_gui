@@ -11,12 +11,22 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"s5picker/internal/gostbin"
 	"s5picker/util"
 )
+
+// gostInstance 一次启动的 gost 子进程实例。
+// 每个实例持有独立的 done 通道：Stop 先关闭自己的 done 再 Kill，
+// 这样该实例的 Wait goroutine 能可靠区分"人为停止"与"异常退出"，
+// 不会误触发自动重启（修复共享 manualStop 的竞态）。
+type gostInstance struct {
+	cmd  *exec.Cmd
+	done chan struct{}
+}
 
 // GostProc gost.exe 子进程托管。
 // 职责：释放内嵌 gost -> 启动双协议监听 -> 切换上游时重启 -> 崩溃自动拉起。
@@ -26,19 +36,21 @@ type GostProc struct {
 	// DirectWhenInactive 未激活上游时是否直连。
 	DirectWhenInactive bool
 
-	cmd        *exec.Cmd
+	mu         sync.Mutex // 串行化 Start/Stop，防止用户点击与自动重启并发
+	inst       *gostInstance
 	exePath    string
 	upstream   atomic.Value // string
 	running    atomic.Bool
-	manualStop atomic.Bool
 	restartCh  chan struct{}
 	stopCh     chan struct{}
 	socksAddr  atomic.Value // string
 	httpAddr   atomic.Value // string
+	backoff    time.Duration
+	consecFail int
 }
 
 func NewGostProc() *GostProc {
-	return &GostProc{restartCh: make(chan struct{}, 1), stopCh: make(chan struct{})}
+	return &GostProc{restartCh: make(chan struct{}, 1), stopCh: make(chan struct{}), backoff: 2 * time.Second}
 }
 
 // EnsureExtracted 把内嵌 gost（gzip 压缩）解压释放到用户数据目录。
@@ -59,8 +71,7 @@ func (g *GostProc) EnsureExtracted() (string, error) {
 	}
 	path := filepath.Join(dir, gostbin.ExeName)
 
-	// 已存在且为合法 gzip 数据解出来的大小一致则复用：
-	// 以 gzip 内容大小校验（解压后的字节数写入 .size 文件）
+	// 用 .size 文件记录内嵌数据长度，与磁盘上的 gost 比对决定是否重新释放
 	sizeFile := path + ".size"
 	var gzLen int
 	if st, err := os.Stat(sizeFile); err == nil && st.Size() > 0 {
@@ -108,15 +119,20 @@ func gunzipTo(data []byte, dest string) error {
 	return err
 }
 
-// Start 以指定上游启动（upstream 为空则直连，受 DirectWhenInactive 控制）。
+// Start 以指定上游启动（upstream 为空则直连）。
 func (g *GostProc) Start(upstream string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.startLocked(upstream)
+}
+
+func (g *GostProc) startLocked(upstream string) error {
 	exe, err := g.EnsureExtracted()
 	if err != nil {
 		return err
 	}
-	g.Stop()
+	g.stopLocked()
 
-	g.manualStop.Store(false)
 	g.upstream.Store(upstream)
 
 	socksPort, err := g.freePort(g.Socks5Port)
@@ -136,38 +152,56 @@ func (g *GostProc) Start(upstream string) error {
 		args = append(args, "-F", upstream)
 	}
 
+	inst := &gostInstance{done: make(chan struct{})}
 	cmd := exec.Command(exe, args...)
 	cmd.Stdout = &logWriter{}
 	cmd.Stderr = &logWriter{}
+	cmd.SysProcAttr = sysProcAttr() // Windows: 隐藏控制台窗口
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	g.cmd = cmd
+	inst.cmd = cmd
+	g.inst = inst
 	g.socksAddr.Store(fmt.Sprintf("127.0.0.1:%d", socksPort))
 	g.httpAddr.Store(fmt.Sprintf("127.0.0.1:%d", httpPort))
 	g.running.Store(true)
 
-	go func() {
+	// 监控 goroutine：只对"自己这个实例"负责。
+	go func(inst *gostInstance) {
 		err := cmd.Wait()
 		g.running.Store(false)
-		if g.manualStop.Load() {
+
+		// 人为停止（Stop/Shutdown/被下一次 Start 替换）→ 静默返回
+		select {
+		case <-inst.done:
+			return
+		default:
+		}
+
+		// 确认当前实例仍是自己（用户没有另外手动启动过）
+		g.mu.Lock()
+		stillCurrent := g.inst == inst
+		if stillCurrent {
+			g.inst = nil
+		}
+		g.mu.Unlock()
+		if !stillCurrent {
 			return
 		}
-		if err != nil {
-			util.Log.Errorf("gost 内核异常退出(%v)，2 秒后自动重启", err)
-		} else {
-			util.Log.Switchf("gost 内核已退出，2 秒后自动重启")
-		}
+
+		util.Log.Errorf("gost 内核异常退出(%v)，稍后自动重启", err)
 		select {
 		case g.restartCh <- struct{}{}:
 		default:
 		}
-	}()
+	}(inst)
 
 	// 就绪检测：等本地端口可连
 	if err := g.waitReady(socksPort, 3*time.Second); err != nil {
 		return err
 	}
+	g.consecFail = 0
+	g.backoff = 2 * time.Second
 	if upstream != "" {
 		util.Log.FwdLogf("本地代理已启动 %s(socks5) / %s(http)，上游 %s",
 			g.SocksAddr(), g.HTTPAddr(), upstream)
@@ -176,6 +210,20 @@ func (g *GostProc) Start(upstream string) error {
 			g.SocksAddr(), g.HTTPAddr())
 	}
 	return nil
+}
+
+// stopLocked 停止当前实例（须持有 g.mu）。
+func (g *GostProc) stopLocked() {
+	if inst := g.inst; inst != nil {
+		// 先标记人为停止，再杀进程，顺序不可颠倒
+		close(inst.done)
+		if inst.cmd.Process != nil {
+			_ = inst.cmd.Process.Kill()
+		}
+		_ = inst.cmd.Wait()
+	}
+	g.inst = nil
+	g.running.Store(false)
 }
 
 // waitReady 轮询等待端口可连。
@@ -213,31 +261,60 @@ func (g *GostProc) freePort(prefer int) (int, error) {
 
 // Stop 停止子进程。
 func (g *GostProc) Stop() {
-	g.manualStop.Store(true)
-	if g.cmd != nil && g.cmd.Process != nil {
-		_ = g.cmd.Process.Kill()
-		_ = g.cmd.Wait()
-	}
-	g.cmd = nil
-	g.running.Store(false)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.stopLocked()
 }
 
-// RestartAsync 请求自动重启（由 monitor 通道触发）。
+// MonitorLoop 自动重启循环：带退避（2s 起，×2，上限 30s），
+// 连续失败 5 次放弃自动重启并提示用户。
 func (g *GostProc) MonitorLoop() {
 	for {
 		select {
 		case <-g.stopCh:
 			return
 		case <-g.restartCh:
+			g.mu.Lock()
+			// 用户已经手动启动了新实例（比如又点了一次切换）→ 不用自动重启
+			if g.inst != nil {
+				g.mu.Unlock()
+				continue
+			}
 			up, _ := g.upstream.Load().(string)
-			if err := g.Start(up); err != nil {
-				util.Log.Errorf("gost 重启失败: %v", err)
-				time.AfterFunc(2*time.Second, func() {
-					select {
-					case g.restartCh <- struct{}{}:
-					default:
-					}
-				})
+			g.consecFail++
+			if g.consecFail > 5 {
+				g.mu.Unlock()
+				util.Log.Errorf("gost 连续 %d 次异常退出，已停止自动重启。请检查上游代理地址或重启程序", g.consecFail-1)
+				continue
+			}
+			delay := g.backoff
+			g.backoff *= 2
+			if g.backoff > 30*time.Second {
+				g.backoff = 30 * time.Second
+			}
+			util.Log.Infof("%v 后自动重启 gost（第 %d 次尝试）", delay, g.consecFail)
+			g.mu.Unlock()
+
+			time.Sleep(delay)
+			select {
+			case <-g.stopCh:
+				return
+			default:
+			}
+
+			g.mu.Lock()
+			if g.inst != nil { // 等待期间用户手动启动了
+				g.mu.Unlock()
+				continue
+			}
+			err := g.startLocked(up)
+			g.mu.Unlock()
+			if err != nil {
+				util.Log.Errorf("gost 自动重启失败: %v", err)
+				select {
+				case g.restartCh <- struct{}{}:
+				default:
+				}
 			}
 		}
 	}

@@ -26,7 +26,7 @@ func TestGostProcE2E(t *testing.T) {
 	t.Logf("本地监听: %s / %s", g.SocksAddr(), g.HTTPAddr())
 
 	// 通过我们托管的本地 socks5 端口访问 cz88（即完整转发链路）
-	res := util.QueryViaProxy("socks5://"+g.SocksAddr(), 8*time.Second)
+	res := queryVia(t, "socks5://"+g.SocksAddr())
 	if !res.OK {
 		t.Fatalf("经本地代理访问外网失败: %v", res.Err)
 	}
@@ -44,4 +44,10 @@ func TestGostProcE2E(t *testing.T) {
 	if g.Running() {
 		t.Fatal("Stop 后仍标记运行")
 	}
+}
+
+// queryVia 复用 cz88 检测链路。
+func queryVia(t *testing.T, proxyURL string) util.GeoResult {
+	t.Helper()
+	return util.QueryViaProxy(proxyURL, 8*time.Second)
 }
