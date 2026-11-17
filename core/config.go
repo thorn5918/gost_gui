@@ -8,11 +8,12 @@ import (
 
 // Config 配置文件（exe 同目录 config.json）。
 type Config struct {
-	Socks5Port          int  `json:"socks5_port"`
-	HTTPPort            int  `json:"http_port"`
-	CheckerConcurrency  int  `json:"checker_concurrency"`
-	CheckTimeoutSec     int  `json:"check_timeout_sec"`
-	DirectWhenInactive  bool `json:"direct_when_inactive"`
+	Socks5Port         int  `json:"socks5_port"`
+	HTTPPort           int  `json:"http_port"`
+	CheckerConcurrency int  `json:"checker_concurrency"`
+	CheckTimeoutSec    int  `json:"check_timeout_sec"`
+	DirectWhenInactive bool `json:"direct_when_inactive"`
+	APIPort            int  `json:"api_port"` // 0 = 关闭控制 API
 }
 
 var Defaults = Config{
@@ -21,6 +22,7 @@ var Defaults = Config{
 	CheckerConcurrency: 32,
 	CheckTimeoutSec:    5,
 	DirectWhenInactive: false,
+	APIPort:            58585,
 }
 
 // LoadConfig 读取配置，不存在或损坏则写回默认值。

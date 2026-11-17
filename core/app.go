@@ -16,6 +16,8 @@ type App struct {
 	Sw      *Switcher
 	Cfg     Config
 	CfgPath string
+
+	api *APIServer
 }
 
 // NewApp 组装引擎。exeDir 为程序所在目录。
@@ -56,6 +58,14 @@ func NewApp(exeDir string) (*App, error) {
 		total, _ := pool.Count()
 		util.Log.Infof("已加载代理 %d 条（%s）", total, proxiesPath)
 	}
+
+	// 本地控制 API（仅 127.0.0.1）
+	if cfg.APIPort > 0 {
+		app.api = NewAPIServer(app)
+		go func() {
+			_ = app.api.Start(cfg.APIPort)
+		}()
+	}
 	return app, nil
 }
 
@@ -84,6 +94,9 @@ func exeDir() string {
 }
 
 func (a *App) Shutdown() {
+	if a.api != nil {
+		a.api.Close()
+	}
 	a.Gost.Shutdown()
 	util.Log.Close()
 }

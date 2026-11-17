@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
-	"sync/atomic"
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
@@ -16,10 +16,17 @@ import (
 	"s5picker/util"
 )
 
-// proxyModel TableView 数据模型。
+// proxyModel TableView 数据模型（支持表头点击排序）。
 type proxyModel struct {
 	walk.TableModelBase
-	rows []*core.Proxy
+	rows      []*core.Proxy
+	sortCol   int
+	sortOrder walk.SortOrder
+	sortPub   walk.EventPublisher
+}
+
+func newProxyModel() *proxyModel {
+	return &proxyModel{sortCol: -1}
 }
 
 func (m *proxyModel) RowCount() int { return len(m.rows) }
@@ -81,6 +88,150 @@ func (m *proxyModel) StyleCell(style *walk.CellStyle) {
 	}
 }
 
+// ---------- 排序（点击表头触发） ----------
+
+// ColumnSortable 所有列均可排序。
+func (m *proxyModel) ColumnSortable(col int) bool { return col >= 0 && col <= 6 }
+
+// Sort 按列排序并发布变更。
+func (m *proxyModel) Sort(col int, order walk.SortOrder) error {
+	if col < 0 {
+		col = -1
+	}
+	m.sortCol, m.sortOrder = col, order
+	m.applySort()
+	m.PublishRowsReset()
+	m.sortPub.Publish()
+	return nil
+}
+
+// SortChanged 排序变化事件。
+func (m *proxyModel) SortChanged() *walk.Event { return m.sortPub.Event() }
+
+// SortedColumn 当前排序列。
+func (m *proxyModel) SortedColumn() int { return m.sortCol }
+
+// SortOrder 当前排序方向。
+func (m *proxyModel) SortOrder() walk.SortOrder { return m.sortOrder }
+
+// applySort 对当前 rows 重新应用排序（刷新数据后保持用户排序）。
+func (m *proxyModel) applySort() {
+	if m.sortCol < 0 {
+		return
+	}
+	asc := m.sortOrder == walk.SortAscending
+	less := m.less(m.sortCol)
+	rows := m.rows
+	sort.SliceStable(rows, func(i, j int) bool {
+		d := less(rows[i], rows[j])
+		if asc {
+			return d < 0
+		}
+		// 降序时空值排最后
+		if isZero(m.sortCol, rows[i]) {
+			return false
+		}
+		if isZero(m.sortCol, rows[j]) {
+			return true
+		}
+		return d > 0
+	})
+}
+
+// less 返回该列的"小于"比较函数（升序语义，空值视为最大）。
+func (m *proxyModel) less(col int) func(a, b *core.Proxy) float64 {
+	switch col {
+	case 0: // 状态：可用 < 检测中 < 未检测 < 失败
+		rank := func(s core.ProxyStatus) float64 {
+			switch s {
+			case core.StatusOK:
+				return 0
+			case core.StatusChecking:
+				return 1
+			case core.StatusUnknown:
+				return 2
+			default:
+				return 3
+			}
+		}
+		return func(a, b *core.Proxy) float64 { return rank(a.Status) - rank(b.Status) }
+	case 1: // 延迟：未测/失败视为无穷大
+		return func(a, b *core.Proxy) float64 { return latVal(a) - latVal(b) }
+	case 5: // 最近检测
+		return func(a, b *core.Proxy) float64 {
+			if a.LastCheck.IsZero() && b.LastCheck.IsZero() {
+				return 0
+			}
+			if a.LastCheck.IsZero() {
+				return 1
+			}
+			if b.LastCheck.IsZero() {
+				return -1
+			}
+			return float64(a.LastCheck.Unix() - b.LastCheck.Unix())
+		}
+	default: // 2 出口IP / 3 省 / 4 市 / 6 上游地址
+		get := func(p *core.Proxy) string {
+			switch col {
+			case 2:
+				return p.ExitIP
+			case 3:
+				return p.Province
+			case 4:
+				return p.City
+			default:
+				return p.Raw
+			}
+		}
+		return func(a, b *core.Proxy) float64 {
+			sa, sb := get(a), get(b)
+			if sa == "" && sb == "" {
+				return 0
+			}
+			if sa == "" {
+				return 1
+			}
+			if sb == "" {
+				return -1
+			}
+			if sa < sb {
+				return -1
+			}
+			if sa > sb {
+				return 1
+			}
+			return 0
+		}
+	}
+}
+
+func latVal(p *core.Proxy) float64 {
+	if p.Latency <= 0 {
+		return 1e12
+	}
+	return float64(p.Latency)
+}
+
+// isZero 判断该列是否为"空值"（降序时排最后）。
+func isZero(col int, p *core.Proxy) bool {
+	switch col {
+	case 0:
+		return false
+	case 1:
+		return p.Latency <= 0
+	case 2:
+		return p.ExitIP == ""
+	case 3:
+		return p.Province == ""
+	case 4:
+		return p.City == ""
+	case 5:
+		return p.LastCheck.IsZero()
+	default:
+		return p.Raw == ""
+	}
+}
+
 // win 封装窗口与控件引用。
 type win struct {
 	app   *core.App
@@ -98,7 +249,6 @@ type win struct {
 
 	provFilter  string
 	includeFail bool
-	switching   atomic.Bool
 	provsKey    string
 }
 
@@ -112,7 +262,7 @@ func Run(version string) {
 	}
 
 	w := &win{app: app}
-	w.model = &proxyModel{}
+	w.model = newProxyModel()
 
 	err = MainWindow{
 		AssignTo: &w.mw,
@@ -275,8 +425,17 @@ func (w *win) refresh() {
 		}
 	}
 
-	// 表格
+	// 表格：筛选 + 排序（首次出结果时默认按延迟升序，最快在前）
 	w.model.rows = w.app.Pool.Filter(w.provFilter, w.includeFail)
+	if w.model.sortCol < 0 {
+		for _, p := range w.model.rows {
+			if p.Latency > 0 {
+				w.model.sortCol, w.model.sortOrder = 1, walk.SortAscending
+				break
+			}
+		}
+	}
+	w.model.applySort()
 	w.model.PublishRowsReset()
 
 	// 主卡片
@@ -312,14 +471,7 @@ func (w *win) refresh() {
 // ---------- 按钮事件 ----------
 
 func (w *win) onSwitch() {
-	if !w.switching.CompareAndSwap(false, true) {
-		util.Log.Switchf("正在切换中，请稍候")
-		return
-	}
-	go func() {
-		defer w.switching.Store(false)
-		w.app.Sw.SwitchBest()
-	}()
+	go w.app.Sw.SwitchBest("")
 }
 
 func (w *win) onCheckAll() {
@@ -360,29 +512,7 @@ func (w *win) onUseSelected() {
 		return
 	}
 	p := w.model.rows[idx]
-	if !w.switching.CompareAndSwap(false, true) {
-		util.Log.Switchf("正在切换中，请稍候")
-		return
-	}
-	go func() {
-		defer w.switching.Store(false)
-		w.useProxy(p)
-	}()
-}
-
-// useProxy 手动使用指定代理。
-func (w *win) useProxy(p *core.Proxy) {
-	util.Log.Switchf("手动选择 %s，复检中…", p.Label())
-	if !w.app.Checker.QuickCheck(p) {
-		util.Log.Switchf("%s 复检失败，放弃使用", p.Label())
-		return
-	}
-	if err := w.app.Gost.Start(p.UpstreamURL()); err != nil {
-		util.Log.Errorf("启用 %s 失败: %v", p.Label(), err)
-		return
-	}
-	w.app.Pool.SetActive(p)
-	util.Log.Switchf("已启用 → %s 出口:%s %s%s", p.Label(), p.ExitIP, p.Province, p.City)
+	go w.app.Sw.UseProxy(p)
 }
 
 func (w *win) onCopyAddr() {

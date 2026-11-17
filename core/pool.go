@@ -273,12 +273,21 @@ func (p *Pool) UnsetChecking(raw string) {
 
 // Candidates 返回可用（OK）代理，按延迟升序。
 func (p *Pool) Candidates() []*Proxy {
+	return p.CandidatesIn("")
+}
+
+// CandidatesIn 同 Candidates，但 province 非空时只返回该省份的。
+func (p *Pool) CandidatesIn(province string) []*Proxy {
 	all := p.All()
 	out := make([]*Proxy, 0, len(all))
 	for _, it := range all {
-		if it.Status == StatusOK {
-			out = append(out, it)
+		if it.Status != StatusOK {
+			continue
 		}
+		if province != "" && it.Province != province {
+			continue
+		}
+		out = append(out, it)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Latency < out[j].Latency })
 	return out
